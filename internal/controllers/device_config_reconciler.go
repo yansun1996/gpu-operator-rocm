@@ -1413,6 +1413,15 @@ func (dcrh *deviceConfigReconcilerHelper) handleNodeLabeller(ctx context.Context
 
 	logger.Info("Reconciled node labeller", "namespace", ds.Namespace, "name", ds.Name, "result", opRes)
 
+	// Missing discovery labels only identify stale nodes when this DeviceConfig
+	// uses AMD NFD discovery for selection. With a custom selector, a healthy GPU
+	// node may never have these labels. Explicit disablement still cleans up above.
+	_, selectsGPU := devConfig.Spec.Selector[utils.NodeFeatureLabelAmdGpu]
+	_, selectsVGPU := devConfig.Spec.Selector[utils.NodeFeatureLabelAmdVGpu]
+	if !selectsGPU && !selectsVGPU {
+		return nil
+	}
+
 	// todo: temp. cleanup labels set by node-labeller
 	// not required once label cleanup is added in node-labeller
 	labelSelector, err := func() (labels.Selector, error) {
@@ -1453,7 +1462,40 @@ func (dcrh *deviceConfigReconcilerHelper) handleNodeLabeller(ctx context.Context
 	}
 	logger.Info(fmt.Sprintf("select (%v) found %v nodes", labelSelector, len(its.Items)))
 
-	if err := dcrh.updateNodeLabels(ctx, devConfig, its, false); err != nil {
+	if len(its.Items) == 0 {
+		return nil
+	}
+
+	// The stale-node query drops the NFD keys from this DeviceConfig's selector,
+	// so it can reach nodes selected by another DeviceConfig. Protect those nodes
+	// using current selectors, including configs that have not reconciled yet or
+	// are in another namespace. nodeAssignments alone cannot cover that case.
+	configs, err := dcrh.listDeviceConfigs(ctx)
+	if err != nil {
+		return err
+	}
+	otherSelectors := []labels.Selector{}
+	for _, config := range configs.Items {
+		if config.Namespace == devConfig.Namespace && config.Name == devConfig.Name {
+			continue
+		}
+		otherSelectors = append(otherSelectors, labels.SelectorFromSet(config.Spec.Selector))
+	}
+	candidates := &v1.NodeList{}
+	for _, node := range its.Items {
+		selectedByOtherConfig := false
+		for _, selector := range otherSelectors {
+			if selector.Matches(labels.Set(node.Labels)) {
+				selectedByOtherConfig = true
+				break
+			}
+		}
+		if !selectedByOtherConfig {
+			candidates.Items = append(candidates.Items, node)
+		}
+	}
+
+	if err := dcrh.updateNodeLabels(ctx, devConfig, candidates, false); err != nil {
 		logger.Error(err, "failed to update node labels")
 	}
 	return nil
