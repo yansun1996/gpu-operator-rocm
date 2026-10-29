@@ -172,7 +172,7 @@ func (s *E2ESuite) verifyNodeLabellerCleanup(c *C, discoveryKey string, withCust
 		_, err := s.clientSet.CoreV1().Nodes().Patch(ctx, node.Name, types.MergePatchType, patch, metav1.PatchOptions{})
 		c.Assert(err, IsNil)
 	}
-	updateConfig := func(config *v1alpha1.DeviceConfig, mutate func(*v1alpha1.DeviceConfig)) {
+	updateSpec := func(config *v1alpha1.DeviceConfig, mutate func(*v1alpha1.DeviceConfig)) int64 {
 		var generation int64
 		err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
 			actual, err := s.dClient.DeviceConfigs(config.Namespace).Get(config.Name, metav1.GetOptions{})
@@ -187,7 +187,10 @@ func (s *E2ESuite) verifyNodeLabellerCleanup(c *C, discoveryKey string, withCust
 			return err
 		})
 		c.Assert(err, IsNil)
-		waitReconciled(config, generation)
+		return generation
+	}
+	updateConfig := func(config *v1alpha1.DeviceConfig, mutate func(*v1alpha1.DeviceConfig)) {
+		waitReconciled(config, updateSpec(config, mutate))
 	}
 	if withCustomConfig {
 		updateConfig(customConfig, func(actual *v1alpha1.DeviceConfig) {
@@ -222,6 +225,38 @@ func (s *E2ESuite) verifyNodeLabellerCleanup(c *C, discoveryKey string, withCust
 	for deadline := time.Now().Add(3 * time.Second); time.Now().Before(deadline); {
 		checkLabels(false)
 		time.Sleep(100 * time.Millisecond)
+	}
+	if withCustomConfig {
+		// Release the protected node using only B's selector update. B now has
+		// no matching nodes and exits before ObservedGeneration is updated.
+		// A must be enqueued by the DeviceConfig watch, without a Node mutation
+		// or an update to A, to clean the newly unowned stale labels.
+		updateSpec(customConfig, func(actual *v1alpha1.DeviceConfig) { actual.Spec.Selector[customKey] = "false" })
+		c.Assert(assert.Eventually(c, func() bool {
+			actual, err := s.clientSet.CoreV1().Nodes().Get(ctx, name+"-missing", metav1.GetOptions{})
+			if err != nil {
+				return false
+			}
+			for key := range ownedLabels {
+				if _, exists := actual.Labels[key]; exists {
+					return false
+				}
+			}
+			return actual.Labels["amd.com/gpu.probe"] == "keep"
+		}, time.Minute, time.Second, "selector change did not trigger stale-label cleanup"), Equals, true)
+
+		// Restore ownership and verify that subsequent reconciles preserve
+		// newly written labeller labels again.
+		updateConfig(customConfig, func(actual *v1alpha1.DeviceConfig) { actual.Spec.Selector[customKey] = "true" })
+		_, err := s.clientSet.CoreV1().Nodes().Patch(ctx, name+"-missing", types.MergePatchType, patch, metav1.PatchOptions{})
+		c.Assert(err, IsNil)
+		updateConfig(cfg, func(actual *v1alpha1.DeviceConfig) {
+			actual.Spec.DevicePlugin.NodeLabellerArguments = []string{"device-id"}
+		})
+		for deadline := time.Now().Add(3 * time.Second); time.Now().Before(deadline); {
+			checkLabels(false)
+			time.Sleep(100 * time.Millisecond)
+		}
 	}
 	updateConfig(cfg, func(actual *v1alpha1.DeviceConfig) { actual.Spec.DevicePlugin.EnableNodeLabeller = ptr.To(false) })
 	checkLabels(true)

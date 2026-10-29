@@ -18,6 +18,7 @@ package controllers
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"testing"
 
@@ -65,6 +66,10 @@ func TestNodeLabellerCleanup(t *testing.T) {
 		otherConfigs        []amdv1alpha1.DeviceConfig
 		reconcileOtherFirst bool
 		listConfigError     bool
+		changeBeforeRead    string
+		changeOnConflict    string
+		configOnConflict    bool
+		patchError          bool
 	}{
 		{name: "custom selector without NFD", selector: custom, driverEnabled: ptr.To(false)},
 		{name: "custom selector with managed driver", selector: custom, driverEnabled: ptr.To(true)},
@@ -95,13 +100,20 @@ func TestNodeLabellerCleanup(t *testing.T) {
 		{name: "config list failure preserves labels and returns error", selector: gpu, listConfigError: true},
 		{name: "other disabled config retains responsibility for cleanup", selector: gpu, otherConfigs: disabledOther},
 		{name: "other deleting config retains responsibility for cleanup", selector: gpu, otherConfigs: deletingOther},
+		{name: "fresh GPU discovery prevents cleanup", selector: gpu, changeBeforeRead: utils.NodeFeatureLabelAmdGpu},
+		{name: "fresh vGPU discovery prevents cleanup", selector: gpu, changeBeforeRead: utils.NodeFeatureLabelAmdVGpu},
+		{name: "fresh ownership label prevents cleanup", selector: gpu, changeBeforeRead: "example.com/new-owner", otherConfigs: other("test", "new-owner", map[string]string{"example.com/new-owner": "true"})},
+		{name: "conflict rechecks discovery", selector: gpu, changeOnConflict: utils.NodeFeatureLabelAmdGpu},
+		{name: "conflict rechecks ownership", selector: gpu, changeOnConflict: "example.com/new-owner", otherConfigs: other("test", "new-owner", map[string]string{"example.com/new-owner": "true"})},
+		{name: "conflict refreshes other config selector", selector: gpu, configOnConflict: true, otherConfigs: other("test", "new-owner", map[string]string{pool: "other"})},
+		{name: "patch failure propagates", selector: gpu, patchError: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			g := NewWithT(t)
 			ctx := context.Background()
 			scheme, err := testutils.TestScheme()
 			g.Expect(err).NotTo(HaveOccurred())
-			node := &v1.Node{ObjectMeta: metav1.ObjectMeta{Name: "gpu-node", Labels: map[string]string{
+			node := &v1.Node{ObjectMeta: metav1.ObjectMeta{Name: "gpu-node", ResourceVersion: "1", Labels: map[string]string{
 				pool: "gpu", "amd.com/gpu.device-id": "75a3", "beta.amd.com/gpu.family": "AI", "beta.amd.com/gpu.family.AI": "1", "amd.com/gpu.probe": "keep",
 			}}}
 			for k, v := range tc.nodeLabels {
@@ -115,6 +127,7 @@ func TestNodeLabellerCleanup(t *testing.T) {
 			ds := &appsv1.DaemonSet{ObjectMeta: metav1.ObjectMeta{Name: "test-node-labeller", Namespace: "test"}}
 			cli := mock_client.NewMockClient(gomock.NewController(t))
 			storedNode := node.DeepCopy()
+			readChanged, conflictInjected := false, false
 			storedDS := map[client.ObjectKey]*appsv1.DaemonSet{client.ObjectKeyFromObject(ds): ds.DeepCopy()}
 			for _, other := range tc.otherConfigs {
 				key := client.ObjectKey{Namespace: other.Namespace, Name: other.Name + utils.NodeLabellerNameSuffix}
@@ -123,6 +136,11 @@ func TestNodeLabellerCleanup(t *testing.T) {
 			cli.EXPECT().Get(ctx, gomock.Any(), gomock.Any()).DoAndReturn(func(_ context.Context, key client.ObjectKey, obj client.Object, _ ...client.GetOption) error {
 				switch obj := obj.(type) {
 				case *v1.Node:
+					if tc.changeBeforeRead != "" && !readChanged {
+						storedNode.Labels[tc.changeBeforeRead] = "true"
+						storedNode.ResourceVersion = "2"
+						readChanged = true
+					}
 					storedNode.DeepCopyInto(obj)
 				case *appsv1.DaemonSet:
 					if storedDS[key] == nil {
@@ -149,9 +167,28 @@ func TestNodeLabellerCleanup(t *testing.T) {
 				}
 				return nil
 			}).AnyTimes()
-			cli.EXPECT().Patch(ctx, gomock.Any(), gomock.Any()).DoAndReturn(func(_ context.Context, obj client.Object, _ client.Patch, _ ...client.PatchOption) error {
+			cli.EXPECT().Patch(ctx, gomock.Any(), gomock.Any()).DoAndReturn(func(_ context.Context, obj client.Object, patch client.Patch, _ ...client.PatchOption) error {
 				switch obj := obj.(type) {
 				case *v1.Node:
+					data, err := patch.Data(obj)
+					g.Expect(err).NotTo(HaveOccurred())
+					var changes map[string]interface{}
+					g.Expect(json.Unmarshal(data, &changes)).To(Succeed())
+					g.Expect(changes["metadata"]).To(HaveKeyWithValue("resourceVersion", storedNode.ResourceVersion))
+					if tc.patchError {
+						return fmt.Errorf("patch unavailable")
+					}
+					if !conflictInjected && (tc.changeOnConflict != "" || tc.configOnConflict) {
+						conflictInjected = true
+						storedNode.ResourceVersion = "2"
+						if tc.changeOnConflict != "" {
+							storedNode.Labels[tc.changeOnConflict] = "true"
+						}
+						if tc.configOnConflict {
+							tc.otherConfigs[0].Spec.Selector = custom
+						}
+						return apierrors.NewConflict(schema.GroupResource{Resource: "nodes"}, node.Name, fmt.Errorf("concurrent change"))
+					}
 					storedNode = obj.DeepCopy()
 				case *appsv1.DaemonSet:
 					storedDS[client.ObjectKeyFromObject(obj)] = obj.DeepCopy()
@@ -173,7 +210,9 @@ func TestNodeLabellerCleanup(t *testing.T) {
 					}
 				}
 				err := helper.handleNodeLabeller(ctx, cfg, &v1.NodeList{Items: []v1.Node{*node}})
-				if tc.listConfigError {
+				if tc.patchError {
+					g.Expect(err).To(MatchError(ContainSubstring("patch unavailable")))
+				} else if tc.listConfigError {
 					g.Expect(err).To(MatchError(ContainSubstring("config list unavailable")))
 				} else {
 					g.Expect(err).NotTo(HaveOccurred())
